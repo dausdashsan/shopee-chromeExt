@@ -101,6 +101,40 @@ export interface FetchProgress {
   currentOrderSn?: string;
 }
 
+export interface WatchedCartItem {
+  key: string; // `${itemId}_${modelId || '0'}`
+  itemId: string;
+  modelId: string;
+  shopId?: string;
+  shopName: string;
+  name: string;
+  modelName: string;
+  imageUrl?: string;
+  currentPrice: number;
+  originalPrice?: number;
+  lowestPrice: number;
+  highestPrice: number;
+  lastCheckedAt: number; // ms
+  inCart: boolean;
+}
+
+export interface PriceSnapshot {
+  id: string; // `${itemKey}_${date}`
+  itemKey: string;
+  itemId: string;
+  modelId: string;
+  date: string; // YYYY-MM-DD (local)
+  price: number;
+  originalPrice?: number;
+  recordedAt: number; // ms
+}
+
+export interface CartItemWithHistory extends WatchedCartItem {
+  history: PriceSnapshot[];
+  lastPaidPrice?: number;
+  lastPaidDate?: string;
+}
+
 /**
  * Normalizes Shopee monetary values.
  * Shopee's internal APIs typically use 100,000 micro-units for MYR (e.g., 2500000 = RM 25.00).
@@ -110,9 +144,9 @@ export function normalizeShopeeAmount(val: number | string | undefined | null): 
   const num = typeof val === 'string' ? parseFloat(val) : val;
   if (isNaN(num)) return 0;
 
-  // Shopee micro-units heuristic: amounts > 10000 for standard consumer purchases are micro-units
-  // E.g. 1500000 micro-units = RM 15.00.
-  if (Math.abs(num) >= 10000) {
+  // Shopee micro-units: 100,000 micro-units = RM 1.00 (1 sen = 1,000 micro-units).
+  // Integers >= 1000 are micro-units; fractional values are assumed to already be in MYR.
+  if (Number.isInteger(num) && Math.abs(num) >= 1000) {
     return Math.round((num / 100000) * 100) / 100;
   }
   return Math.round(num * 100) / 100;

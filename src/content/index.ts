@@ -16,7 +16,12 @@ function safeSendMessage(msg: any) {
 }
 
 // Ask the MAIN-world interceptor to run a fetch with the page's own (Shopee-wrapped) fetch
-function fetchViaPage(path: string, timeoutMs = 20000): Promise<{ success: boolean; status?: number; data?: any; error?: string }> {
+function fetchViaPage(
+  path: string,
+  timeoutMs = 20000,
+  method: 'GET' | 'POST' = 'GET',
+  body?: unknown
+): Promise<{ success: boolean; status?: number; data?: any; error?: string }> {
   return new Promise((resolve) => {
     const reqId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
     const onMsg = (event: MessageEvent) => {
@@ -31,7 +36,7 @@ function fetchViaPage(path: string, timeoutMs = 20000): Promise<{ success: boole
       resolve({ success: false, error: 'Timed out waiting for page fetch' });
     }, timeoutMs);
     window.addEventListener('message', onMsg);
-    window.postMessage({ type: 'SHOPEE_TRACKER_FETCH', reqId, path }, window.location.origin);
+    window.postMessage({ type: 'SHOPEE_TRACKER_FETCH', reqId, path, method, body }, window.location.origin);
   });
 }
 
@@ -53,6 +58,14 @@ try {
       fetchViaPage(`/api/v4/order/get_order_detail?order_id=${orderId}`).then(sendResponse);
       return true;
     }
+    if (msg?.type === 'FETCH_CART_FROM_TAB') {
+      fetchViaPage('/api/v4/cart/get', 20000, 'POST', { pre_selected_item_list: [], version: 3 }).then(sendResponse);
+      return true;
+    }
+    if (msg?.type === 'CART_PRICE_UPDATED' && isCartPage()) {
+      refreshCartPriceDrawer();
+      return false;
+    }
     return false;
   });
 } catch {}
@@ -60,6 +73,17 @@ try {
 // Listen for intercepted network responses from MAIN world
 window.addEventListener('message', (event) => {
   if (event.source !== window || !event.data) return;
+
+  if (event.data.type === 'SHOPEE_TRACKER_CART_DATA') {
+    safeSendMessage({
+      type: 'INTERCEPTED_CART_DATA',
+      data: event.data.data,
+    });
+    if (isCartPage()) {
+      setTimeout(() => refreshCartPriceDrawer(), 400);
+    }
+    return;
+  }
 
   if (event.data.type === 'SHOPEE_TRACKER_INTERCEPTED_DATA') {
     const json = event.data.data;
@@ -197,6 +221,7 @@ function injectWidget() {
 
   container.innerHTML = `
     <div id="shopee-tracker-card" style="
+      display: none;
       background: #ffffff;
       border: 1px solid #e2e8f0;
       border-radius: 16px;
@@ -294,9 +319,9 @@ function injectWidget() {
       </div>
     </div>
 
-    <!-- Collapsed Pill (hidden initially) -->
+    <!-- Collapsed Pill (shown by default) -->
     <button id="shopee-tracker-pill" style="
-      display: none;
+      display: flex;
       background: #ee4d2d;
       color: white;
       border: none;
@@ -374,8 +399,319 @@ function updateWidgetUI() {
   }
 }
 
-if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', injectWidget);
-} else {
-  injectWidget();
+function isPurchasePage(): boolean {
+  return window.location.pathname.startsWith('/user/purchase');
 }
+
+function isCartPage(): boolean {
+  return window.location.pathname.startsWith('/cart');
+}
+
+function escapeHtml(str: string): string {
+  return String(str ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function buildSparklineSvg(history: Array<{ date: string; price: number }>): string {
+  const width = 260;
+  const height = 56;
+  const padX = 6;
+  const padY = 8;
+
+  if (!history.length) {
+    return `<svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"></svg>`;
+  }
+
+  const prices = history.map((h) => h.price);
+  const min = Math.min(...prices);
+  const max = Math.max(...prices);
+  const span = max - min || 1;
+
+  const coords = history.map((pt, i) => {
+    const x =
+      history.length === 1
+        ? width / 2
+        : padX + (i / (history.length - 1)) * (width - padX * 2);
+    const y =
+      max === min
+        ? height / 2
+        : padY + (1 - (pt.price - min) / span) * (height - padY * 2);
+    return { x: Math.round(x * 10) / 10, y: Math.round(y * 10) / 10, ...pt };
+  });
+
+  const pointsAttr = coords.map((c) => `${c.x},${c.y}`).join(' ');
+  const areaAttr = `${coords[0].x},${height - 2} ${pointsAttr} ${coords[coords.length - 1].x},${height - 2}`;
+
+  const dots = coords
+    .map(
+      (c) =>
+        `<circle cx="${c.x}" cy="${c.y}" r="3" fill="#ee4d2d" stroke="#ffffff" stroke-width="1.2"><title>${escapeHtml(c.date)}: RM ${c.price.toFixed(2)}</title></circle>`
+    )
+    .join('');
+
+  return `
+    <svg width="100%" height="${height}" viewBox="0 0 ${width} ${height}" style="overflow: visible; display: block;">
+      <polygon points="${areaAttr}" fill="rgba(238, 77, 45, 0.12)" />
+      ${coords.length > 1 ? `<polyline fill="none" stroke="#ee4d2d" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="${pointsAttr}" />` : ''}
+      ${dots}
+    </svg>
+  `;
+}
+
+function injectCartWidget() {
+  if (document.getElementById('shopee-cart-tracker-container')) return;
+
+  const container = document.createElement('div');
+  container.id = 'shopee-cart-tracker-container';
+  container.style.cssText = `
+    position: fixed;
+    bottom: 24px;
+    right: 24px;
+    z-index: 9999999;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  `;
+
+  container.innerHTML = `
+    <div id="shopee-cart-drawer" style="
+      display: none;
+      background: #ffffff;
+      border: 1px solid #e2e8f0;
+      border-radius: 16px;
+      box-shadow: 0 20px 35px -10px rgba(0, 0, 0, 0.18);
+      width: 340px;
+      max-height: 75vh;
+      flex-direction: column;
+      overflow: hidden;
+    ">
+      <div style="
+        background: #ee4d2d;
+        color: white;
+        padding: 12px 14px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+      ">
+        <div style="font-weight: 700; font-size: 13px;">📈 Cart Price History</div>
+        <div style="display: flex; gap: 6px; align-items: center;">
+          <button id="shopee-cart-refresh-btn" style="
+            background: rgba(255,255,255,0.2);
+            border: none;
+            color: white;
+            border-radius: 6px;
+            padding: 3px 8px;
+            cursor: pointer;
+            font-size: 11px;
+            font-weight: 600;
+          ">Log Today</button>
+          <button id="shopee-cart-close-btn" style="
+            background: rgba(255,255,255,0.2);
+            border: none;
+            color: white;
+            border-radius: 6px;
+            padding: 3px 8px;
+            cursor: pointer;
+            font-size: 11px;
+          ">Hide</button>
+        </div>
+      </div>
+      <div id="shopee-cart-list" style="
+        padding: 12px;
+        overflow-y: auto;
+        max-height: calc(75vh - 96px);
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        background: #f8fafc;
+      ">
+        <div style="font-size: 12px; color: #64748b; text-align: center; padding: 16px;">Loading cart price history...</div>
+      </div>
+      <div style="
+        padding: 8px 12px;
+        background: #ffffff;
+        border-top: 1px solid #e2e8f0;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        font-size: 11px;
+        color: #64748b;
+      ">
+        <span id="shopee-cart-last-checked">Checked: —</span>
+        <button id="shopee-cart-open-dash" style="
+          background: none;
+          border: none;
+          color: #ee4d2d;
+          font-weight: 600;
+          cursor: pointer;
+          font-size: 11px;
+        ">Open Dashboard →</button>
+      </div>
+    </div>
+
+    <button id="shopee-cart-pill" style="
+      display: flex;
+      background: #ee4d2d;
+      color: white;
+      border: none;
+      border-radius: 9999px;
+      padding: 10px 16px;
+      font-size: 12px;
+      font-weight: 700;
+      box-shadow: 0 4px 14px rgba(238, 77, 45, 0.4);
+      cursor: pointer;
+      align-items: center;
+      gap: 6px;
+    ">
+      <span>📈 Price History</span>
+    </button>
+  `;
+
+  document.body.appendChild(container);
+
+  const drawer = document.getElementById('shopee-cart-drawer')!;
+  const pill = document.getElementById('shopee-cart-pill')!;
+  const closeBtn = document.getElementById('shopee-cart-close-btn')!;
+  const refreshBtn = document.getElementById('shopee-cart-refresh-btn')!;
+  const dashBtn = document.getElementById('shopee-cart-open-dash')!;
+
+  pill.addEventListener('click', () => {
+    drawer.style.display = 'flex';
+    pill.style.display = 'none';
+    refreshCartPriceDrawer();
+  });
+
+  closeBtn.addEventListener('click', () => {
+    drawer.style.display = 'none';
+    pill.style.display = 'flex';
+  });
+
+  refreshBtn.addEventListener('click', () => {
+    refreshBtn.textContent = 'Logging...';
+    chrome.runtime.sendMessage({ type: 'CHECK_CART_NOW' }, () => {
+      refreshBtn.textContent = 'Log Today';
+      refreshCartPriceDrawer();
+    });
+  });
+
+  dashBtn.addEventListener('click', () => {
+    safeSendMessage({ type: 'OPEN_DASHBOARD' });
+  });
+
+  refreshCartPriceDrawer();
+}
+
+function refreshCartPriceDrawer() {
+  if (!chrome.runtime?.id) return;
+  chrome.runtime.sendMessage({ type: 'GET_CART_PRICE_HISTORY' }, (res) => {
+    const listEl = document.getElementById('shopee-cart-list');
+    const pillEl = document.getElementById('shopee-cart-pill');
+    const lastEl = document.getElementById('shopee-cart-last-checked');
+    if (!listEl) return;
+
+    const items: any[] = (res?.items || []).filter((i: any) => i.inCart);
+    if (pillEl) {
+      pillEl.textContent = items.length ? `📈 Price History (${items.length})` : '📈 Price History';
+    }
+    if (lastEl && res?.lastCheckedAt) {
+      lastEl.textContent = `Logged: ${new Date(res.lastCheckedAt).toLocaleDateString('en-MY', { month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit' })}`;
+    }
+
+    if (!items.length) {
+      listEl.innerHTML = `<div style="font-size: 12px; color: #64748b; text-align: center; padding: 16px;">No cart items logged yet. Click "Log Today" or scroll your cart.</div>`;
+      return;
+    }
+
+    listEl.innerHTML = items
+      .map((item) => {
+        const hist = item.history || [];
+        const firstDate = hist[0]?.date || '';
+        const lastDate = hist[hist.length - 1]?.date || '';
+        const diff = item.lowestPrice < item.currentPrice
+          ? `+RM ${(item.currentPrice - item.lowestPrice).toFixed(2)} vs low`
+          : hist.length > 1
+            ? 'At lowest!'
+            : 'Day 1 logged';
+        const diffColor = item.lowestPrice < item.currentPrice ? '#d97706' : '#059669';
+
+        return `
+          <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 10px;">
+            <div style="display: flex; justify-content: space-between; gap: 8px; align-items: flex-start;">
+              <div style="display: flex; gap: 8px; align-items: center; min-width: 0; flex: 1;">
+                ${
+                  item.imageUrl
+                    ? `<img src="${escapeHtml(item.imageUrl)}" alt="" style="width: 36px; height: 36px; border-radius: 8px; object-fit: cover; border: 1px solid #e2e8f0; flex-shrink: 0; background: #f1f5f9;" onerror="this.style.display='none'" />`
+                    : ''
+                }
+                <div style="min-width: 0;">
+                  <div style="font-size: 12px; font-weight: 600; color: #0f172a; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</div>
+                  ${item.modelName ? `<div style="font-size: 10px; color: #64748b; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${escapeHtml(item.modelName)}</div>` : ''}
+                </div>
+              </div>
+              <div style="text-align: right; flex-shrink: 0;">
+                <div style="font-size: 13px; font-weight: 800; color: #ee4d2d;">RM ${Number(item.currentPrice).toFixed(2)}</div>
+                <div style="font-size: 10px; font-weight: 600; color: ${diffColor};">${diff}</div>
+              </div>
+            </div>
+            <div style="margin-top: 8px; background: #fff7ed; border-radius: 8px; padding: 6px 8px;">
+              ${buildSparklineSvg(hist)}
+              <div style="display: flex; justify-content: space-between; font-size: 9px; color: #64748b; margin-top: 2px;">
+                <span>${escapeHtml(firstDate)}</span>
+                <span>Low: RM ${Number(item.lowestPrice).toFixed(2)} • High: RM ${Number(item.highestPrice).toFixed(2)}</span>
+                <span>${escapeHtml(lastDate)}</span>
+              </div>
+            </div>
+            ${item.lastPaidPrice ? `<div style="margin-top: 5px; font-size: 10px; color: #475569;">Last paid: <strong>RM ${Number(item.lastPaidPrice).toFixed(2)}</strong></div>` : ''}
+          </div>
+        `;
+      })
+      .join('');
+  });
+}
+
+function syncWidgetVisibility() {
+  const existingPurchase = document.getElementById('shopee-tracker-widget-container');
+  if (isPurchasePage()) {
+    if (!existingPurchase && document.body) {
+      injectWidget();
+    } else if (existingPurchase) {
+      existingPurchase.style.display = '';
+    }
+  } else {
+    if (isAutoSyncing) stopAutoSync();
+    if (existingPurchase) {
+      existingPurchase.style.display = 'none';
+    }
+  }
+
+  const existingCart = document.getElementById('shopee-cart-tracker-container');
+  if (isCartPage()) {
+    if (!existingCart && document.body) {
+      injectCartWidget();
+    } else if (existingCart) {
+      existingCart.style.display = '';
+      refreshCartPriceDrawer();
+    }
+  } else if (existingCart) {
+    existingCart.style.display = 'none';
+  }
+}
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', syncWidgetVisibility);
+} else {
+  syncWidgetVisibility();
+}
+
+// Shopee is an SPA; watch for route changes so the widget appears/hides on /user/purchase
+let lastHref = window.location.href;
+window.addEventListener('popstate', syncWidgetVisibility);
+window.addEventListener('hashchange', syncWidgetVisibility);
+setInterval(() => {
+  if (window.location.href !== lastHref) {
+    lastHref = window.location.href;
+    syncWidgetVisibility();
+  }
+}, 1000);

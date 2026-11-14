@@ -10,7 +10,22 @@ import {
 } from '../types/shopee';
 import { db } from '../db';
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const sleep = (ms: number, signal?: AbortSignal) =>
+  new Promise<void>((resolve) => {
+    if (signal?.aborted) {
+      resolve();
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
 
 export class ShopeeFetcherService {
   private abortController: AbortController | null = null;
@@ -52,7 +67,10 @@ export class ShopeeFetcherService {
   async saveRawPayload(json: RawShopeeApiResponse): Promise<number> {
     const { orders } = this.extractOrdersFromPayload(json, 10);
     if (orders.length > 0) {
-      const normalized = orders.map((o) => this.normalizeOrder(o));
+      const normalized = orders
+        .map((o) => this.normalizeOrder(o))
+        .filter((o): o is NormalizedOrder => o !== null);
+      if (normalized.length === 0) return 0;
       await this.fillMissingDates(normalized);
       await db.upsertOrders(normalized);
       return normalized.length;
@@ -68,14 +86,17 @@ export class ShopeeFetcherService {
    * fullSync=false (default): newest first, stop after a page whose orders are all already saved
    * and finished (completed / cancelled / refunded). Unfinished orders keep being refreshed.
    * fullSync=true: walk the whole history again.
+   * openTabIfNeeded=false: if the direct request fails, only use a Shopee tab that is already
+   * open (used by the background daily sync, so it never opens tabs on its own).
    */
   async fetchAllPurchases(
     onProgress: (progress: FetchProgress) => void,
     onLog?: (log: string) => void,
     limit: number = 10,
-    options: { fullSync?: boolean } = {}
+    options: { fullSync?: boolean; openTabIfNeeded?: boolean } = {}
   ): Promise<{ success: boolean; totalFetched: number; error?: string }> {
     const fullSync = options.fullSync ?? false;
+    const openTabIfNeeded = options.openTabIfNeeded ?? true;
     if (this.isRunning) {
       return { success: false, totalFetched: 0, error: 'A sync is already in progress' };
     }
@@ -130,13 +151,13 @@ export class ShopeeFetcherService {
           } catch (directErr: any) {
             log(`Direct fetch encountered: ${directErr.message}. Switching to tab-assisted fetch...`);
             useTabFallback = true;
-            fallbackTabId = await this.ensureShopeeTab(log);
+            fallbackTabId = await this.ensureShopeeTab(log, openTabIfNeeded);
             log(`Using Shopee Tab #${fallbackTabId} for fetching...`);
             ordersBatch = await this.fetchPageFromTab(fallbackTabId, offset, limit);
           }
         } else {
           if (!fallbackTabId) {
-            fallbackTabId = await this.ensureShopeeTab(log);
+            fallbackTabId = await this.ensureShopeeTab(log, openTabIfNeeded);
           }
           log(`Fetching batch: offset=${offset}, limit=${limit} (via Tab #${fallbackTabId})...`);
           ordersBatch = await this.fetchPageFromTab(fallbackTabId, offset, limit);
@@ -156,30 +177,41 @@ export class ShopeeFetcherService {
         }
 
         log(`Received ${ordersBatch.orders.length} orders in this batch.`);
-        const normalizedBatch = ordersBatch.orders.map((o) => this.normalizeOrder(o));
+        const normalizedBatch = ordersBatch.orders
+          .map((o) => this.normalizeOrder(o))
+          .filter((o): o is NormalizedOrder => o !== null);
 
-        const existing = await db.getByIds(normalizedBatch.map((o) => o.orderId));
-        // Keep dates already looked up, so old orders aren't re-fetched from order detail every sync
-        normalizedBatch.forEach((o, i) => {
-          const prev = existing[i];
-          if (!o.createdAt && prev?.createdAt) {
-            o.createdAt = prev.createdAt;
-            o.createdAtFormatted = prev.createdAtFormatted;
-            o.dateIsApproximate = prev.dateIsApproximate;
-            if (prev.orderSn && prev.orderSn !== prev.orderId) o.orderSn = prev.orderSn;
+        if (normalizedBatch.length > 0) {
+          const existing = await db.getByIds(normalizedBatch.map((o) => o.orderId));
+          // Keep dates already looked up, so old orders aren't re-fetched from order detail every sync
+          normalizedBatch.forEach((o, i) => {
+            const prev = existing[i];
+            if (!o.createdAt && prev?.createdAt) {
+              o.createdAt = prev.createdAt;
+              o.createdAtFormatted = prev.createdAtFormatted;
+              o.dateIsApproximate = prev.dateIsApproximate;
+              if (prev.orderSn && prev.orderSn !== prev.orderId) o.orderSn = prev.orderSn;
+            }
+          });
+          var batchAlreadyFinal =
+            !fullSync &&
+            existing.length === normalizedBatch.length &&
+            existing.every((prev) => prev && (prev.isCompleted || prev.isCancelled || prev.isRefunded));
+
+          await this.fillMissingDates(normalizedBatch, log, useTabFallback ? fallbackTabId : null, signal, csrfToken);
+          if (signal.aborted) {
+            log('Sync cancelled by user.');
+            this.isRunning = false;
+            return { success: false, totalFetched, error: 'Sync was cancelled' };
           }
-        });
-        const batchAlreadyFinal =
-          !fullSync &&
-          existing.length === normalizedBatch.length &&
-          existing.every((prev) => prev && (prev.isCompleted || prev.isCancelled || prev.isRefunded));
 
-        await this.fillMissingDates(normalizedBatch, log, useTabFallback ? fallbackTabId : null);
-
-        // Save batch immediately to IndexedDB
-        await db.upsertOrders(normalizedBatch);
-        totalFetched += normalizedBatch.length;
-        log(`Saved to local database. Total orders cached so far: ${totalFetched}.`);
+          // Save batch immediately to IndexedDB
+          await db.upsertOrders(normalizedBatch);
+          totalFetched += normalizedBatch.length;
+          log(`Saved to local database. Total orders cached so far: ${totalFetched}.`);
+        } else {
+          var batchAlreadyFinal = false;
+        }
 
         onProgress({
           currentOffset: offset,
@@ -210,7 +242,7 @@ export class ShopeeFetcherService {
           // Polite delay between pages
           const delay = 450 + Math.floor(Math.random() * 250);
           log(`Waiting ${delay}ms before next page...`);
-          await new Promise((r) => setTimeout(r, delay));
+          await sleep(delay, signal);
         }
       }
 
@@ -291,7 +323,9 @@ export class ShopeeFetcherService {
   async fillMissingDates(
     orders: NormalizedOrder[],
     log?: (msg: string) => void,
-    tabId: number | null = null
+    tabId: number | null = null,
+    signal?: AbortSignal,
+    csrfToken?: string
   ): Promise<void> {
     const missing = orders.filter((o) => !o.createdAt);
     if (!missing.length) return;
@@ -299,15 +333,17 @@ export class ShopeeFetcherService {
 
     let directWorks = true;
     for (const order of missing) {
+      if (signal?.aborted) return;
       let detail: any = null;
       if (directWorks) {
         try {
-          detail = await this.fetchOrderDetailDirect(order.orderId);
-        } catch {
+          detail = await this.fetchOrderDetailDirect(order.orderId, csrfToken, signal);
+        } catch (err: any) {
+          if (err?.name === 'AbortError' || signal?.aborted) return;
           directWorks = false;
         }
       }
-      if (!detail) {
+      if (!detail && !signal?.aborted) {
         if (tabId === null) {
           const tabs = await chrome.tabs
             .query({ url: ['https://shopee.com.my/*', 'https://*.shopee.com.my/*'] })
@@ -332,24 +368,30 @@ export class ShopeeFetcherService {
       }
       if (info?.order_sn) order.orderSn = info.order_sn;
 
-      await sleep(400 + Math.floor(Math.random() * 300));
+      await sleep(400 + Math.floor(Math.random() * 300), signal);
     }
 
     const still = missing.filter((o) => !o.createdAt).length;
-    if (still) log?.(`Could not find the order time for ${still} order(s); they show as "Unknown date".`);
+    if (still && !signal?.aborted) {
+      log?.(`Could not find the order time for ${still} order(s); they show as "Unknown date".`);
+    }
   }
 
-  private async fetchOrderDetailDirect(orderId: string): Promise<any> {
+  private async fetchOrderDetailDirect(orderId: string, csrfToken?: string, signal?: AbortSignal): Promise<any> {
+    const headers: Record<string, string> = {
+      Accept: 'application/json, text/plain, */*',
+      'x-requested-with': 'XMLHttpRequest',
+      'x-api-source': 'pc',
+      'x-shopee-language': 'en',
+    };
+    if (csrfToken) headers['x-csrftoken'] = csrfToken;
+
     const res = await fetch(
       `https://shopee.com.my/api/v4/order/get_order_detail?order_id=${encodeURIComponent(orderId)}`,
       {
-        headers: {
-          Accept: 'application/json, text/plain, */*',
-          'x-requested-with': 'XMLHttpRequest',
-          'x-api-source': 'pc',
-          'x-shopee-language': 'en',
-        },
+        headers,
         credentials: 'include',
+        signal,
       }
     );
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -431,9 +473,13 @@ export class ShopeeFetcherService {
   /**
    * Ensures an active Shopee tab exists and has content script loaded
    */
-  private async ensureShopeeTab(log: (msg: string) => void): Promise<number> {
+  private async ensureShopeeTab(log: (msg: string) => void, allowOpen: boolean = true): Promise<number> {
     const tabs = await chrome.tabs.query({ url: ['https://shopee.com.my/*', 'https://*.shopee.com.my/*'] });
     let tab = tabs[0];
+
+    if ((!tab || !tab.id) && !allowOpen) {
+      throw new Error('Direct request was blocked and no Shopee tab is open');
+    }
 
     if (!tab || !tab.id) {
       log('Opening Shopee MY tab in background...');
@@ -479,14 +525,16 @@ export class ShopeeFetcherService {
     return tabId;
   }
 
-  private normalizeOrder(raw: any): NormalizedOrder {
+  private normalizeOrder(raw: any): NormalizedOrder | null {
     if (raw?.order_list_detail) raw = raw.order_list_detail;
     if (raw?.info_card?.order_list_cards && raw.status && typeof raw.status === 'object') {
       return this.normalizeListDetail(raw);
     }
 
     const infoCard = raw.info_card || {};
-    const orderId = String(raw.order_id || infoCard.order_id || raw.order_sn || infoCard.order_sn || Math.random());
+    const rawId = raw.order_id ?? infoCard.order_id ?? raw.order_sn ?? infoCard.order_sn;
+    if (rawId === undefined || rawId === null || rawId === '') return null;
+    const orderId = String(rawId);
     const orderSn = raw.order_sn || infoCard.order_sn || orderId;
 
     const createTimeSeconds =
@@ -590,7 +638,6 @@ export class ShopeeFetcherService {
       shopId,
       itemCount,
       items,
-      rawPayload: raw,
     };
   }
 
@@ -600,10 +647,12 @@ export class ShopeeFetcherService {
    *   info_card: { order_id, final_total, order_list_cards: [{ shop_info, product_info: { item_groups: [{ items }] } }] } }
    * The list no longer carries create_time or order_sn, so the date is the last tracking update.
    */
-  private normalizeListDetail(raw: any): NormalizedOrder {
+  private normalizeListDetail(raw: any): NormalizedOrder | null {
     const infoCard = raw.info_card || {};
     const cards: any[] = Array.isArray(infoCard.order_list_cards) ? infoCard.order_list_cards : [];
-    const orderId = String(infoCard.order_id ?? cards[0]?.order_id ?? Math.random());
+    const rawId = infoCard.order_id ?? cards[0]?.order_id;
+    if (rawId === undefined || rawId === null || rawId === '') return null;
+    const orderId = String(rawId);
 
     // 1) exact: decode from the order ID; 2) approximate: last tracking update; 3) unknown (filled later via order detail)
     const decoded = decodeOrderTimeMs(orderId);
@@ -674,7 +723,6 @@ export class ShopeeFetcherService {
       shopId: shop.shop_id ? String(shop.shop_id) : undefined,
       itemCount,
       items,
-      rawPayload: raw,
     };
   }
 

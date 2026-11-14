@@ -46,11 +46,13 @@
     "tabs",
     "scripting",
     "activeTab",
-    "declarativeNetRequest"
+    "declarativeNetRequest",
+    "alarms"
   ],
   "host_permissions": [
     "https://shopee.com.my/*",
-    "https://*.shopee.com.my/*"
+    "https://*.shopee.com.my/*",
+    "https://note.spekitam.my/*"
   ],
   "web_accessible_resources": [
     {
